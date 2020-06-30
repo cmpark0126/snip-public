@@ -1,8 +1,9 @@
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+
 import functools
+import sys
 
 from network import load_network
-
 
 class Model(object):
     def __init__(self,
@@ -11,10 +12,14 @@ class Model(object):
                  num_classes,
                  target_sparsity,
                  optimizer,
+                 weight_decay,
                  lr_decay_type,
                  lr,
                  decay_boundaries,
                  decay_values,
+                 decay_steps,
+                 end_learning_rate,
+                 power,
                  initializer_w_bp,
                  initializer_b_bp,
                  initializer_w_ap,
@@ -25,34 +30,53 @@ class Model(object):
         self.num_classes = num_classes
         self.target_sparsity = target_sparsity
         self.optimizer = optimizer
+        self.weight_decay = weight_decay
         self.lr_decay_type = lr_decay_type
         self.lr = lr
         self.decay_boundaries = decay_boundaries
         self.decay_values = decay_values
+        self.decay_steps = decay_steps
+        self.end_learning_rate = end_learning_rate
+        self.power = power
         self.initializer_w_bp = initializer_w_bp
         self.initializer_b_bp = initializer_b_bp
         self.initializer_w_ap = initializer_w_ap
         self.initializer_b_ap = initializer_b_ap
 
+    '''
+    Create Computational Graph
+    '''
     def construct_model(self):
         # Base-learner
         self.net = net = load_network(
             self.datasource, self.arch, self.num_classes,
+            # bp: before pruning
             self.initializer_w_bp, self.initializer_b_bp,
+            # ap: after pruning
             self.initializer_w_ap, self.initializer_b_ap,
         )
 
+        print('network number of params: ', net.num_params)
+
         # Input nodes
         self.inputs = net.inputs
+
+        # This values are control model running option
         self.compress = tf.placeholder_with_default(False, [])
         self.is_train = tf.placeholder_with_default(False, [])
         self.pruned = tf.placeholder_with_default(False, [])
 
-        # Switch for weights to use (before or after pruning)
-        weights = tf.cond(self.pruned, lambda: net.weights_ap, lambda: net.weights_bp)
+        # Switch for weights to use (before or after pruning) + improvement
+        # weights = tf.cond(self.pruned, lambda: net.weights_ap, lambda: net.weights_bp)
+        weights = net.weights_ap
 
-        # For convenience
-        prn_keys = [k for p in ['w', 'b'] for k in weights.keys() if p in k]
+        # For convenience + improvement
+        # e.g., ['w1', 'w2', 'w3', 'w4', 'b1', 'b2', 'b3', 'b4']
+        # prn_keys = [k for p in ['w', 'u', 'b'] for k in weights.keys() if p in k]
+        prn_keys = [k for p in ['w', 'u'] for k in weights.keys() if p in k]
+        print("prn_keys: ", prn_keys)
+        # Create partial function
+        # https://docs.python.org/2/library/functools.html#functools.partial
         var_no_train = functools.partial(tf.Variable, trainable=False, dtype=tf.float32)
 
         # Model
@@ -65,25 +89,47 @@ class Model(object):
                 self.is_train, trainable=False)
             loss = tf.reduce_mean(compute_loss(self.inputs['label'], logits))
             grads = tf.gradients(loss, [mask_init[k] for k in prn_keys])
+            # Map keys and gradients
             gradients = dict(zip(prn_keys, grads))
+
+            # For improvement
+            rescaled_grad = {}
+            for k in prn_keys:
+                norm_of_weight = tf.norm(w_mask[k], ord=2)
+                norm_of_grad = tf.norm(gradients[k], ord=2)
+                rescaled_grad[k] = gradients[k] * (norm_of_grad / (norm_of_weight + 1e-16))
+            gradients = rescaled_grad
+
+            # Calculate connection sensitivity
             cs = normalize_dict({k: tf.abs(v) for k, v in gradients.items()})
+
             return create_sparse_mask(cs, self.target_sparsity)
 
         mask = tf.cond(self.compress, lambda: get_sparse_mask(), lambda: mask_prev)
+        # Update `mask_prev` with `mask`
+        # To mark dependencies, use `control_dependencies` method
         with tf.control_dependencies([tf.assign(mask_prev[k], v) for k,v in mask.items()]):
             w_final = apply_mask(weights, mask)
+        
+        # For weight visualization
+        # pruned_weight1 = tf.reduce_mean(mask['w1'], axis=[1], keepdims=True)
+        # scaled_pruned_weight1 = pruned_weight1 * 255
+        # scaled_pruned_weight1 = tf.math.round(scaled_pruned_weight1)
+        # weight1_for_visualization = tf.reshape(scaled_pruned_weight1, [28, 28])
+        # weight1_for_visualization = tf.cast(weight1_for_visualization, tf.uint8)
 
         # Forward pass
         logits = net.forward_pass(w_final, self.inputs['input'], self.is_train)
 
         # Loss
         opt_loss = tf.reduce_mean(compute_loss(self.inputs['label'], logits))
-        reg = 0.00025 * tf.reduce_sum([tf.reduce_sum(tf.square(v)) for v in w_final.values()])
+        reg = self.weight_decay * tf.reduce_sum([tf.reduce_sum(tf.square(v)) for v in w_final.values()])
         opt_loss = opt_loss + reg
 
         # Optimization
         optim, lr, global_step = prepare_optimization(opt_loss, self.optimizer, self.lr_decay_type,
-            self.lr, self.decay_boundaries, self.decay_values)
+                                                      self.lr, self.decay_boundaries, self.decay_values, 
+                                                      self.decay_steps, self.end_learning_rate, self.power)
         update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS) # TF version issue
         with tf.control_dependencies(update_ops):
             self.train_op = optim.minimize(opt_loss, global_step=global_step)
@@ -98,6 +144,9 @@ class Model(object):
             'los': opt_loss,
             'acc': output_accuracy,
             'acc_individual': output_accuracy_individual,
+            # 'weight1_for_visualization': weight1_for_visualization,
+            'lr': lr,
+            'mask': mask,
         }
         self.sparsity = compute_sparsity(w_final, prn_keys)
 
@@ -118,17 +167,27 @@ def get_optimizer(optimizer, lr):
         optimizer = tf.train.GradientDescentOptimizer(lr)
     elif optimizer == 'momentum':
         optimizer = tf.train.MomentumOptimizer(lr, 0.9)
+    elif optimizer == 'adam':
+        optimizer = tf.train.AdamOptimizer(lr, 0.9, 0.999, 1e-08)
     else:
         raise NotImplementedError
     return optimizer
 
-def prepare_optimization(loss, optimizer, lr_decay_type, learning_rate, boundaries, values):
+def prepare_optimization(loss, optimizer, lr_decay_type, learning_rate, 
+                         boundaries, values, decay_steps, end_learning_rate, power):
     global_step = tf.Variable(0, trainable=False)
     if lr_decay_type == 'constant':
         learning_rate = tf.constant(learning_rate)
     elif lr_decay_type == 'piecewise':
         assert len(boundaries)+1 == len(values)
         learning_rate = tf.train.piecewise_constant(global_step, boundaries, values)
+    elif lr_decay_type == 'polynomial':
+        learning_rate = tf.train.polynomial_decay(
+                            learning_rate,
+                            global_step, 
+                            decay_steps,
+                            end_learning_rate,
+                            power)
     else:
         raise NotImplementedError
     optim = get_optimizer(optimizer, learning_rate)
@@ -172,7 +231,10 @@ def compute_sparsity(weights, target_keys):
 def create_sparse_mask(mask, target_sparsity):
     def threshold_vec(vec, target_sparsity):
         num_params = vec.shape.as_list()[0]
+        # Calculate how much parameter to leave using `target_sparsity`
+        # `kappa` - number of remained parameter after pruning
         kappa = int(round(num_params * (1. - target_sparsity)))
+        # Choosing the weight to leave (number: kappa)
         topk, ind = tf.nn.top_k(vec, k=kappa, sorted=True)
         mask_sparse_v = tf.sparse_to_dense(ind, tf.shape(vec),
             tf.ones_like(ind, dtype=tf.float32), validate_indices=False)

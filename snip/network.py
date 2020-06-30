@@ -1,4 +1,7 @@
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+from tensorflow.python.ops import rnn, rnn_cell
+import sys
+tf.disable_v2_behavior()
 
 from functools import reduce
 from helpers import static_size
@@ -29,6 +32,36 @@ def load_network(
         'vgg-like': lambda: VGG(
             initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
             datasource, num_classes, version='like'),
+        'wrn-16-8': lambda: WRN(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, depth=16, k=8),
+        'wrn-16-10': lambda: WRN(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, depth=16, k=10),
+        'wrn-22-8': lambda: WRN(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, depth=22, k=8),
+        'resnet20': lambda: ResNet(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, layers=[3,3,3], name='resnet20'),
+        'resnet56': lambda: ResNet(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, layers=[9,9,9], name='resnet56'),
+        'resnet110': lambda: ResNet(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, layers=[18,18,18], name='resnet56'),
+        'lstm-s': lambda: LSTM(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, 128,),
+        'lstm-b': lambda: LSTM(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, 256,),
+        'gru-s': lambda: GRU(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, 128,),
+        'gru-b': lambda: GRU(
+            initializer_w_bp, initializer_b_bp, initializer_w_ap, initializer_b_ap,
+            datasource, num_classes, 256,),
     }
     return networks[arch]()
 
@@ -36,7 +69,13 @@ def load_network(
 def get_initializer(initializer, dtype):
     if initializer == 'zeros':
         return tf.zeros_initializer(dtype=dtype)
+    elif initializer == 'ones':
+        return tf.ones_initializer(dtype=dtype)
     elif initializer == 'vs':
+        return tf.variance_scaling_initializer(dtype=dtype)
+    elif initializer == 'xavier':
+        return tf.glorot_normal_initializer(dtype=dtype)
+    elif initializer == 'he':
         return tf.variance_scaling_initializer(dtype=dtype)
     else:
         raise NotImplementedError
@@ -431,3 +470,529 @@ class VGG(object):
             inputs = tf.matmul(inputs, weights['w15']) + weights['b15']
 
         return inputs
+
+
+class WRN(object):
+    def __init__(self,
+                 initializer_w_bp,
+                 initializer_b_bp,
+                 initializer_w_ap,
+                 initializer_b_ap,
+                 datasource,
+                 num_classes,
+                 depth,
+                 k,
+                 ):
+        assert (depth - 4) % 6 == 0, 'depth should be 6n+4'
+        self.num_block = (depth - 4) // 6
+        self.widths = [int(v * k) for v in (16, 32, 64)]
+        self.datasource = datasource
+        self.num_classes = num_classes
+        self.name = 'WRN-{}-{}'.format(depth, k)
+        self.input_dims = [64, 64, 3] if self.datasource == 'tiny-imagenet' else [32, 32, 3] # h,w,c
+        self.inputs = self.construct_inputs()
+        self.weights_bp = self.construct_weights(initializer_w_bp, initializer_b_bp, False, 'bp')
+        self.weights_ap = self.construct_weights(initializer_w_ap, initializer_b_ap, True, 'ap')
+        self.num_params = sum([static_size(v) for v in self.weights_ap.values()])
+        self.num_of_weight_params = sum([static_size(self.weights_ap[k]) for p in ['w', 'u'] for k in self.weights_ap.keys() if p in k])
+
+    def construct_inputs(self):
+        return {
+            'input': tf.placeholder(tf.float32, [None] + self.input_dims),
+            'label': tf.placeholder(tf.int32, [None]),
+        }
+
+    def construct_weights(self, initializer_w, initializer_b, trainable, scope):
+        dtype = tf.float32
+        w_params = {
+            'initializer': get_initializer(initializer_w, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        b_params = {
+            'initializer': get_initializer(initializer_b, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        weights = {}
+        with tf.variable_scope(scope):
+            weights['init-w0'] = tf.get_variable('init-w0', [3, 3, 3, 16], **w_params)
+            weights['init-b0'] = tf.get_variable('init-b0', [16], **b_params)
+            self.get_group_weights_biases(weights, 'g0', 
+                                          16, self.widths[0], 
+                                          w_params, b_params,
+                                          self.num_block)
+            self.get_group_weights_biases(weights, 'g1', 
+                                          self.widths[0], self.widths[1], 
+                                          w_params, b_params,
+                                          self.num_block)
+            self.get_group_weights_biases(weights, 'g2', 
+                                          self.widths[1], self.widths[2], 
+                                          w_params, b_params,
+                                          self.num_block)
+            weights['fc-w0'] = tf.get_variable('fc-w0', 
+                                               [self.widths[2], self.num_classes], 
+                                               **w_params)
+            weights['fc-b0'] = tf.get_variable('fc-b0',
+                                               [self.num_classes], 
+                                               **b_params)
+            # for k in weights:
+            #     print(k)
+            #     print(weights[k])
+            #     print()
+            # sys.exit("TODO: construct WRN model")
+        return weights
+    
+    def get_group_weights_biases(self, weights, tag_groub, ni, no, w_params, b_params, count_block):
+        for i in range(count_block):
+            tag_block = '{}-s{}'.format(tag_groub, i)
+            self.get_block_weights_biases(weights, tag_block, 
+                                          ni if i == 0 else no, no, 
+                                          w_params, b_params)
+
+    def get_block_weights_biases(self, weights, tag_block, ni, no, w_params, b_params):
+        tag_w0 = '{}-w0'.format(tag_block)
+        weights[tag_w0] = tf.get_variable(tag_w0, [3, 3, ni, no], **w_params)
+        tag_b0 = '{}-b0'.format(tag_block)
+        weights[tag_b0] = tf.get_variable(tag_b0, [no], **b_params)
+        tag_w1 = '{}-w1'.format(tag_block)
+        weights[tag_w1] = tf.get_variable(tag_w1, [3, 3, no, no], **w_params)
+        tag_b1 = '{}-b1'.format(tag_block)
+        weights[tag_b1] = tf.get_variable(tag_b1, [no], **b_params)
+        if ni != no:
+            tag_w2 = '{}-w2'.format(tag_block)
+            weights[tag_w2] = tf.get_variable(tag_w2, [1, 1, ni, no], **w_params)
+            tag_b2 = '{}-b2'.format(tag_block)
+            weights[tag_b2] = tf.get_variable(tag_b2, [no], **b_params)
+        return
+
+    def forward_pass(self, weights, inputs, is_train, trainable=True):
+        bn_params = {
+            'training': is_train,
+            'trainable': trainable,
+        }
+        init_st = 2 if self.datasource == 'tiny-imagenet' else 1
+
+        x = tf.nn.conv2d(inputs, weights['init-w0'], [1, init_st, init_st, 1], 'SAME') + weights['init-b0']
+        # print('x shape', x.shape)
+        g0 = self.forward_pass_group(weights, 'g0', x, is_train, trainable, bn_params, 1, self.num_block)
+        # print('g0 shape', g0.shape)
+        g1 = self.forward_pass_group(weights, 'g1', g0, is_train, trainable, bn_params, 2, self.num_block)
+        # print('g1 shape', g1.shape)
+        g2 = self.forward_pass_group(weights, 'g2', g1, is_train, trainable, bn_params, 2, self.num_block)
+        # print('g1 shape', g2.shape)
+        o = tf.layers.batch_normalization(g2, **bn_params)
+        o = tf.nn.relu(o)
+        # print('o shape', o.shape)
+        # global average pooling
+        gap = tf.layers.flatten(tf.reduce_mean(o, axis=[1, 2], keepdims=True))
+        # print('gap shape', gap.shape)
+        logits = tf.matmul(gap, weights['fc-w0']) + weights['fc-b0']
+        # print('logits shape', logits.shape)
+        return logits
+
+    def forward_pass_group(self, weights, tag_groub, inputs, 
+                           is_train, trainable, bn_params, stride, count_block):
+        o = inputs
+        for i in range(count_block):
+            tag_block = '{}-s{}'.format(tag_groub, i)
+            o = self.forward_pass_block(weights, tag_block, o,
+                                        is_train, trainable, bn_params, 
+                                        stride if i == 0 else 1)
+        return o
+    
+    def forward_pass_block(self, weights, tag_block, x, 
+                           is_train, trainable, bn_params, stride):
+        tag_w0 = '{}-w0'.format(tag_block)
+        tag_b0 = '{}-b0'.format(tag_block)
+        o1 = self.forward_pass_bn_relu(x, bn_params)
+        y = self.forward_pass_conv2d(o1, {'w': weights[tag_w0], 'b': weights[tag_b0]}, stride)
+
+        tag_w1 = '{}-w1'.format(tag_block)
+        tag_b1 = '{}-b1'.format(tag_block)
+        o2 = self.forward_pass_bn_relu(y, bn_params)
+        z = self.forward_pass_conv2d(o2, {'w': weights[tag_w1], 'b': weights[tag_b1]}, 1)
+        
+        tag_w2 = '{}-w2'.format(tag_block)
+        tag_b2 = '{}-b2'.format(tag_block)
+        if tag_w2 in weights:
+            return z + self.forward_pass_conv2d(o1, {'w': weights[tag_w2], 'b': weights[tag_b2]}, stride)
+        else:
+            return z + x
+    
+    def forward_pass_bn_relu(self, inputs, bn_params):
+        o = tf.layers.batch_normalization(inputs, **bn_params)
+        o = tf.nn.relu(o)
+        return o
+    
+    def forward_pass_conv2d(self, inputs, filt, st=1):
+        o = tf.nn.conv2d(inputs, filt['w'], [1, st, st, 1], 'SAME') + filt['b']
+        return o
+
+class ResNet(object):
+    def __init__(self,
+                 initializer_w_bp,
+                 initializer_b_bp,
+                 initializer_w_ap,
+                 initializer_b_ap,
+                 datasource,
+                 num_classes,
+                 layers,
+                 name,
+                 ):
+        self.datasource = datasource
+        self.num_classes = num_classes
+        self.layers = layers
+        self.name = name
+        self._inplaces = 16
+        self.input_dims = [64, 64, 3] if self.datasource == 'tiny-imagenet' else [32, 32, 3] # h,w,c
+        self.inputs = self.construct_inputs()
+        self.weights_bp = self.construct_weights(initializer_w_bp, initializer_b_bp, False, 'bp')
+        self.weights_ap = self.construct_weights(initializer_w_ap, initializer_b_ap, True, 'ap')
+        self.num_params = sum([static_size(v) for v in self.weights_ap.values()])
+        self.num_of_weight_params = sum([static_size(self.weights_ap[k]) for p in ['w', 'u'] for k in self.weights_ap.keys() if p in k])
+
+    def construct_inputs(self):
+        return {
+            'input': tf.placeholder(tf.float32, [None] + self.input_dims),
+            'label': tf.placeholder(tf.int32, [None]),
+        }
+
+    def construct_weights(self, initializer_w, initializer_b, trainable, scope):
+        dtype = tf.float32
+        w_params = {
+            'initializer': get_initializer(initializer_w, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        b_params = {
+            'initializer': get_initializer(initializer_b, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        
+        self.inplaces = self._inplaces
+        weights = {}
+        with tf.variable_scope(scope):
+            weights['init-w0'] = tf.get_variable('init-w0', [3, 3, 3, self.inplaces], **w_params)
+            self.get_group_weights_biases(weights, 'g0', 16, 16,
+                                          w_params, b_params,
+                                          self.layers[0])
+            self.get_group_weights_biases(weights, 'g1', 16, 32, 
+                                          w_params, b_params,
+                                          self.layers[1])
+            self.get_group_weights_biases(weights, 'g2', 32, 64, 
+                                          w_params, b_params,
+                                          self.layers[2])
+            weights['fc-w0'] = tf.get_variable('fc-w0', [64, self.num_classes], 
+                                               **w_params)
+            weights['fc-b0'] = tf.get_variable('fc-b0', [self.num_classes], 
+                                               **b_params)
+            # for k in weights:
+            #     print(k)
+            #     print(weights[k])
+            #     print()
+            # sys.exit("TODO: construct ResNet model")
+        return weights
+    
+    def get_group_weights_biases(self, weights, tag_groub, inplaces, planes, w_params, b_params, count_block):
+        for i in range(count_block):
+            tag_block = '{}-s{}'.format(tag_groub, i)
+            self.get_block_weights_biases(weights, tag_block, 
+                                          inplaces if i == 0 else planes, planes,
+                                          w_params, b_params)
+
+    def get_block_weights_biases(self, weights, tag_block, inplaces, planes, w_params, b_params):
+        tag_w0 = '{}-w0'.format(tag_block)
+        weights[tag_w0] = tf.get_variable(tag_w0, [3, 3, inplaces, planes], **w_params)
+        tag_w1 = '{}-w1'.format(tag_block)
+        weights[tag_w1] = tf.get_variable(tag_w1, [3, 3, planes, planes], **w_params)
+        if inplaces != planes:
+            tag_downsample = '{}-w2'.format(tag_block)
+            weights[tag_downsample] = tf.get_variable(tag_downsample, [1, 1, inplaces, planes], **w_params)
+        return
+
+    def forward_pass(self, weights, inputs, is_train, trainable=True):
+        bn_params = {
+            'training': is_train,
+            'trainable': trainable,
+        }
+        init_st = 2 if self.datasource == 'tiny-imagenet' else 1
+
+        x = tf.nn.conv2d(inputs, weights['init-w0'], [1, init_st, init_st, 1], 'SAME')
+        x = self.forward_pass_bn_relu(x, bn_params)
+        # print('x shape', x.shape)
+        g0 = self.forward_pass_group(weights, 'g0', x, is_train, trainable, bn_params, 1, self.layers[0])
+        # print('g0 shape', g0.shape)
+        g1 = self.forward_pass_group(weights, 'g1', g0, is_train, trainable, bn_params, 2, self.layers[1])
+        # print('g1 shape', g1.shape)
+        g2 = self.forward_pass_group(weights, 'g2', g1, is_train, trainable, bn_params, 2, self.layers[2])
+        # print('g2 shape', g2.shape)
+        # global average pooling
+        gap = tf.layers.flatten(tf.reduce_mean(g2, axis=[1, 2], keepdims=True))
+        # print('gap shape', gap.shape)
+        logits = tf.matmul(gap, weights['fc-w0']) + weights['fc-b0']
+        # print('logits shape', logits.shape)
+        return logits
+
+    def forward_pass_group(self, weights, tag_groub, inputs, 
+                           is_train, trainable, bn_params, stride, count_block):
+        o = inputs
+        for i in range(count_block):
+            tag_block = '{}-s{}'.format(tag_groub, i)
+            o = self.forward_pass_block(weights, tag_block, o,
+                                        is_train, trainable, bn_params, 
+                                        stride if i == 0 else 1)
+        return o
+    
+    def forward_pass_block(self, weights, tag_block, x, 
+                           is_train, trainable, bn_params, stride):
+        tag_w0 = '{}-w0'.format(tag_block)
+        o1 = self.forward_pass_conv2d(x, {'w': weights[tag_w0]}, stride)
+        y = self.forward_pass_bn_relu(o1, bn_params)
+
+        tag_w1 = '{}-w1'.format(tag_block)
+        o2 = self.forward_pass_conv2d(y, {'w': weights[tag_w1]}, 1)
+        z = tf.layers.batch_normalization(o2, **bn_params)
+        
+        tag_downsample = '{}-w2'.format(tag_block)
+        if tag_downsample in weights:
+            o3 = self.forward_pass_conv2d(x, {'w': weights[tag_downsample]}, stride)
+            shortcut = tf.layers.batch_normalization(o3, **bn_params)
+
+            return tf.nn.relu(z + shortcut)
+        else:
+            return tf.nn.relu(z + x)
+    
+    def forward_pass_bn_relu(self, inputs, bn_params):
+        o = tf.layers.batch_normalization(inputs, **bn_params)
+        o = tf.nn.relu(o)
+        return o
+    
+    def forward_pass_conv2d(self, inputs, filt, st=1):
+        o = tf.nn.conv2d(inputs, filt['w'], [1, st, st, 1], 'SAME')
+        return o
+
+class LSTM(object):
+    def __init__(self,
+                 initializer_w_bp,
+                 initializer_b_bp,
+                 initializer_w_ap,
+                 initializer_b_ap,
+                 datasource,
+                 num_classes,
+                 hidden_unit
+                 ):
+        self.datasource = datasource
+        self.num_classes = num_classes
+        self.name = 'LSTM'
+        self.n_chunks = 28
+        self.input_nodes = 28
+        self.hidden_unit = hidden_unit
+        self.input_dims = [28, 28, 1] # height, width, channel
+        self.batch_size = 100
+        self.inputs = self.construct_inputs()
+        self.weights_bp = self.construct_weights(initializer_w_bp, initializer_b_bp, False, 'bp')
+        self.weights_ap = self.construct_weights(initializer_w_ap, initializer_b_ap, True, 'ap')
+        self.weights_ = None
+        self.num_params = sum([static_size(v) for v in self.weights_ap.values()])
+
+    def construct_inputs(self):
+        return {
+            'input': tf.placeholder(tf.float32, [None] + self.input_dims),
+            'label': tf.placeholder(tf.int32, [None]),
+        }
+
+    def construct_weights(self, initializer_w, initializer_b, trainable, scope):
+        dtype = tf.float32
+        w_params = {
+            'initializer': get_initializer(initializer_w, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        u_params = {
+            'initializer': get_initializer(initializer_w, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        b_params = {
+            'initializer': get_initializer(initializer_b, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+
+        weights = {}
+        with tf.variable_scope(scope):
+            weights['wi'] = tf.get_variable('wi', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['ui'] = tf.get_variable('ui', [self.hidden_unit, self.hidden_unit], **u_params)
+            weights['bi'] = tf.get_variable('bi', [self.hidden_unit], **b_params)
+
+            weights['wf'] = tf.get_variable('wf', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['uf'] = tf.get_variable('uf', [self.hidden_unit, self.hidden_unit], **u_params)
+            weights['bf'] = tf.get_variable('bf', [self.hidden_unit], **b_params)
+
+            weights['wog'] = tf.get_variable('wog', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['uog'] = tf.get_variable('uog', [self.hidden_unit, self.hidden_unit], **u_params)
+            weights['bog'] = tf.get_variable('bog', [self.hidden_unit], **b_params)
+
+            weights['wc'] = tf.get_variable('wc', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['uc'] = tf.get_variable('uc', [self.hidden_unit, self.hidden_unit], **u_params)
+            weights['bc'] = tf.get_variable('bc', [self.hidden_unit], **b_params)
+
+            weights['fc-w'] = tf.get_variable('fc-w', [self.hidden_unit, self.num_classes], **w_params)
+            weights['fc-b'] = tf.get_variable('fc-b', [self.num_classes], **b_params)
+
+        return weights
+
+    def forward_pass(self, weights, inputs, is_train, trainable=True):
+        reshaped_inputs = tf.reshape(inputs, [-1, self.n_chunks, self.input_nodes])
+
+        batch_input_ = tf.transpose(reshaped_inputs, [2,0,1])
+        processed_input = tf.transpose(batch_input_)
+        
+        initial_hidden = reshaped_inputs[:, 0, :]
+        initial_hidden = tf.matmul(initial_hidden, tf.zeros([self.input_nodes, self.hidden_unit]))
+        initial_hidden = tf.stack([initial_hidden, initial_hidden])
+
+        self.weights_ = weights
+        all_hidden_states = self.forward_pass_states(processed_input, initial_hidden)
+        all_outputs = tf.map_fn(self.forward_pass_output, all_hidden_states)
+
+        return all_outputs[-1]
+    
+    def forward_pass_states(self, processed_input, initial_hidden):
+        all_hidden_states = tf.scan(
+                                self.forward_pass_lstm, 
+                                processed_input, 
+                                initializer=initial_hidden, 
+                                name='states')
+        all_hidden_states = all_hidden_states[:, 0, :, :]
+        return all_hidden_states
+        
+    def forward_pass_lstm(self, previous_hidden_memory_tuple, x):
+        previous_hidden_state, c_prev = tf.unstack(previous_hidden_memory_tuple)
+
+        i = tf.sigmoid( tf.matmul(x, self.weights_['wi']) +
+                        tf.matmul(previous_hidden_state, self.weights_['ui']) + self.weights_['bi'])
+
+        f = tf.sigmoid( tf.matmul(x, self.weights_['wf']) +
+                        tf.matmul(previous_hidden_state, self.weights_['uf']) + self.weights_['bf'])
+
+        o = tf.sigmoid( tf.matmul(x, self.weights_['wog']) +
+                        tf.matmul(previous_hidden_state, self.weights_['uog']) + self.weights_['bog'])
+
+        c_ = tf.nn.tanh(tf.matmul(x, self.weights_['wc']) +
+                        tf.matmul(previous_hidden_state, self.weights_['uc']) + self.weights_['bc'])
+
+        c = f * c_prev + i * c_
+        current_hidden_state = o * tf.nn.tanh(c)
+
+        return tf.stack([current_hidden_state, c])
+
+    def forward_pass_output(self, hidden_state):
+        return tf.matmul(hidden_state, self.weights_['fc-w']) + self.weights_['fc-b']
+
+class GRU(object):
+    def __init__(self,
+                 initializer_w_bp,
+                 initializer_b_bp,
+                 initializer_w_ap,
+                 initializer_b_ap,
+                 datasource,
+                 num_classes,
+                 hidden_unit
+                 ):
+        self.datasource = datasource
+        self.num_classes = num_classes
+        self.name = 'GRU'
+        self.n_chunks = 28
+        self.input_nodes = 28
+        self.hidden_unit = hidden_unit
+        self.input_dims = [28, 28, 1] # height, width, channel
+        self.batch_size = 100
+        self.inputs = self.construct_inputs()
+        self.weights_bp = self.construct_weights(initializer_w_bp, initializer_b_bp, False, 'bp')
+        self.weights_ap = self.construct_weights(initializer_w_ap, initializer_b_ap, True, 'ap')
+        self.weights_ = None
+        self.num_params = sum([static_size(v) for v in self.weights_ap.values()])
+
+    def construct_inputs(self):
+        return {
+            'input': tf.placeholder(tf.float32, [None] + self.input_dims),
+            'label': tf.placeholder(tf.int32, [None]),
+        }
+
+    def construct_weights(self, initializer_w, initializer_b, trainable, scope):
+        dtype = tf.float32
+        w_params = {
+            'initializer': get_initializer(initializer_w, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+        b_params = {
+            'initializer': get_initializer(initializer_b, dtype),
+            'dtype': dtype,
+            'trainable': trainable,
+            'collections': [self.name, tf.GraphKeys.GLOBAL_VARIABLES],
+        }
+
+        weights = {}
+        with tf.variable_scope(scope):
+            weights['wr'] = tf.get_variable('wr', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['br'] = tf.get_variable('br', [self.hidden_unit], **b_params)
+
+            weights['wz'] = tf.get_variable('wz', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['bz'] = tf.get_variable('bz', [self.hidden_unit], **b_params)
+
+            weights['wx'] = tf.get_variable('wx', [self.input_nodes, self.hidden_unit], **w_params)
+            weights['wh'] = tf.get_variable('wh', [self.hidden_unit, self.hidden_unit], **w_params)
+
+            weights['wo'] = tf.get_variable('wo', [self.hidden_unit, self.num_classes], **w_params)
+            weights['bo'] = tf.get_variable('bo', [self.num_classes], **b_params)
+
+        return weights
+
+    def forward_pass(self, weights, inputs, is_train, trainable=True):
+        reshaped_inputs = tf.reshape(inputs, [-1, self.n_chunks, self.input_nodes])
+
+        batch_input_ = tf.transpose(reshaped_inputs, [2,0,1])
+        processed_input = tf.transpose(batch_input_)
+        
+        initial_hidden = reshaped_inputs[:, 0, :]
+        initial_hidden = tf.matmul(initial_hidden, tf.zeros([self.input_nodes, self.hidden_unit]))
+
+        self.weights_ = weights
+        all_hidden_states = self.forward_pass_states(processed_input, initial_hidden)
+        all_outputs = tf.map_fn(self.forward_pass_output, all_hidden_states)
+
+        return all_outputs[-1]
+    
+    def forward_pass_states(self, processed_input, initial_hidden):
+        all_hidden_states = tf.scan(
+                                self.forward_pass_gru, 
+                                processed_input, 
+                                initializer=initial_hidden, 
+                                name='states')
+        return all_hidden_states
+        
+    def forward_pass_gru(self, previous_hidden_state, x):
+        z = tf.sigmoid(tf.matmul(x, self.weights_['wz']) + self.weights_['bz'])
+        r = tf.sigmoid(tf.matmul(x, self.weights_['wr']) + self.weights_['br'])
+
+        h_ = tf.tanh(tf.matmul(x, self.weights_['wx']) +
+                     tf.matmul(previous_hidden_state, self.weights_['wh']) * r)
+
+        current_hidden_state = tf.multiply((1 - z), h_) + tf.multiply(previous_hidden_state, z)
+
+        return current_hidden_state
+
+    def forward_pass_output(self, hidden_state):
+        return tf.nn.relu(tf.matmul(hidden_state, self.weights_['wo']) + self.weights_['bo'])

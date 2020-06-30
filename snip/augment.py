@@ -1,6 +1,8 @@
 import numpy as np
 
 from imgaug import augmenters as iaa
+# provided by https://github.com/aleju/imgaug/issues/537
+np.random.bit_generator = np.random._bit_generator
 
 
 def augment(batch, kinds, random_state):

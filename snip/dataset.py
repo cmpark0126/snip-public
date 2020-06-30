@@ -53,6 +53,16 @@ class Dataset(object):
             'label': np.asarray(labels),
             'id': np.asarray(ids),
         }
+    
+    def get_label_batch(self, mode, label):
+        ids = np.argwhere(self.dataset[mode]['label'] == label)
+        inputs = self.dataset[mode]['input'][ids]
+        labels = self.dataset[mode]['label'][ids]
+        return {
+            'input': inputs.reshape((-1, 28, 28, 1)),
+            'label': labels.reshape(-1),
+            'id': ids.reshape(-1),
+        }
 
     def generate_example_epoch(self, mode):
         example_ids = range(self.num_example[mode])

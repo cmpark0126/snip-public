@@ -4,7 +4,7 @@ This repository contains code for the paper [SNIP: Single-shot Network Pruning b
 ## Prerequisites
 
 ### Dependencies
-* tensorflow < 2
+* tensorflow == 2 (TODO: adjust code to use pure tf2 function)
 * python 2.7 or python 3.6
 * packages in `requirements.txt`
 
