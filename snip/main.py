@@ -42,7 +42,7 @@ def parse_arguments():
     parser.add_argument('--logdir', type=str, default='logs', help='location for summaries and checkpoints')
     parser.add_argument('--check_interval', type=int, default=100, help='check interval during training')
     parser.add_argument('--save_interval', type=int, default=1000, help='save interval during training')
-    # Experiment 4
+    # For visualize the weight matrix
     parser.add_argument('--target_label', type=int, default=0, help='pruning model with specific label')
     parser.add_argument('--path_visualization_result', type=str, default='./test', help='pruning model with specific label')
     args = parser.parse_args()
