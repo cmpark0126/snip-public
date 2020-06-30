@@ -1,7 +1,7 @@
 # SNIP
 This repository contains code for the paper [SNIP: Single-shot Network Pruning based on Connection Sensitivity (ICLR 2019)](https://arxiv.org/abs/1810.02340).
 
-**Update**: This repository is improved version of original SNIP code. you can easilly find the contents [HERE](https://drive.google.com/drive/folders/1GbNsc05jsr2q9ABJfAsDc8fXpUXFvKTN) how we improve the SNIP with very simple way.
+**Update**: This repository is improved version of original SNIP code. [This report](https://drive.google.com/file/d/1CgH86l4dPWXYnKRtTUj0ypEm7rwMB-VO/view) shows how we improve the SNIP.
 
 ## Prerequisites
 
